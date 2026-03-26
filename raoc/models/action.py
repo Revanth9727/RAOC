@@ -18,8 +18,11 @@ class ActionType(str, Enum):
     FILE_READ   = 'file_read'
     FILE_WRITE  = 'file_write'
     FILE_BACKUP = 'file_backup'
+    FILE_DELETE = 'file_delete'
+    DIR_CREATE  = 'dir_create'
     CMD_EXECUTE = 'cmd_execute'
     CMD_INSPECT = 'cmd_inspect'
+    SCREENSHOT  = 'screenshot'
 
 
 class ActionObject(BaseModel):
