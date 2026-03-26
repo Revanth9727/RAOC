@@ -1,0 +1,31 @@
+# zone_config.yaml — RAOC zone model
+# Defines which filesystem paths RAOC can access and under what conditions.
+# This file is read-only at runtime. Agents never write to it.
+#
+# Zone types:
+#   safe_workspace  — full automation, no approval needed
+#   read_only       — reads auto-approved, writes blocked
+#   restricted      — any action requires user approval
+#   forbidden       — no action ever permitted
+#
+# Path matching: most specific (longest) prefix wins.
+# Hard-coded overrides (cannot be changed here):
+#   ~/raoc_workspace  → always safe_workspace
+#   ~/.ssh, ~/Library/Keychains, ~/.aws, ~/.config  → always forbidden
+
+safe_workspace:
+  - ~/raoc_workspace
+
+read_only:
+  - ~/Documents/Reference
+  - ~/Downloads
+
+restricted:
+  - ~/Desktop
+  - ~/Documents
+
+forbidden:
+  - ~/.ssh
+  - ~/Library/Keychains
+  - ~/.aws
+  - ~/.config
