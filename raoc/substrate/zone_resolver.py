@@ -76,7 +76,14 @@ class ZoneResolver:
         for zone_name, zone_type in zone_map.items():
             for raw_path in (data.get(zone_name) or []):
                 resolved = Path(raw_path).expanduser().resolve()
-                self._zones[str(resolved)] = zone_type
+                key = str(resolved)
+                if key in self._zones and self._zones[key] != zone_type:
+                    logger.warning(
+                        "zone_config.yaml: path %s appears in both '%s' and '%s' zones; "
+                        "keeping '%s' (last assignment wins — fix your config).",
+                        resolved, self._zones[key].value, zone_type.value, zone_type.value,
+                    )
+                self._zones[key] = zone_type
 
         self._config_loaded = True
         logger.info("ZoneResolver loaded %d zone entries from %s", len(self._zones), config_path)
