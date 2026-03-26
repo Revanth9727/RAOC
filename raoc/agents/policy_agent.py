@@ -9,6 +9,7 @@ responsibility — this agent only stamps and returns.
 """
 
 import logging
+from pathlib import Path
 
 from raoc.db import queries
 from raoc.models.action import ActionObject, ActionType
@@ -18,19 +19,12 @@ from raoc.substrate.zone_resolver import ZoneResolver
 
 logger = logging.getLogger(__name__)
 
-# Action types that are read-only — safe in read_only zones
+# Action types that are read-only — auto-approved in read_only zones.
+# Anything not in this set is treated as a write and blocked in read_only zones.
 _READ_TYPES = {
     ActionType.FILE_READ,
     ActionType.CMD_INSPECT,
     ActionType.SCREENSHOT,
-}
-
-# Action types that write — blocked in read_only zones
-_WRITE_TYPES = {
-    ActionType.FILE_WRITE,
-    ActionType.FILE_BACKUP,
-    ActionType.FILE_DELETE,
-    ActionType.DIR_CREATE,
 }
 
 
@@ -79,23 +73,19 @@ class PolicyAgent:
         return results
 
     def _evaluate_action(self, action: ActionObject) -> PolicyResult:
-        """Return the PolicyResult for one action using the three-step decision table.
+        """Return the PolicyResult for one action using the decision table.
 
-        Step 1 — Forbidden check (always first): if zone is forbidden → blocked.
-        Step 2 — Capability override: if CMD_EXECUTE → approval_required.
-        Step 3 — Zone table: safe_workspace/read_only/restricted rules.
-        Step 4 — Judgment zone: AmbiguousZoneError or zip target.
+        Pre-step — Zone resolution: AmbiguousZoneError → judgment_zone immediately.
+        Step 1 — Forbidden check (always wins): forbidden zone → blocked.
+        Step 2 — Capability override: CMD_EXECUTE → approval_required (any zone).
+        Step 3 — Zone table: safe_workspace → auto_approved; read_only + read →
+                 auto_approved; read_only + non-read → blocked; restricted →
+                 approval_required.
         """
-        from pathlib import Path
-
         target = action.target_path or ''
-        action_type_str = (
-            action.action_type.value
-            if hasattr(action.action_type, 'value')
-            else str(action.action_type)
-        )
+        action_type_str = str(action.action_type)
 
-        # Resolve zone (may raise AmbiguousZoneError → judgment_zone)
+        # Pre-step: Zone resolution (may raise AmbiguousZoneError → judgment_zone)
         try:
             zone = self.zone_resolver.resolve(Path(target))
         except AmbiguousZoneError:
@@ -150,6 +140,7 @@ class PolicyAgent:
             except ValueError:
                 pass
 
+            # Anything not in _READ_TYPES is treated as a write — blocked in read-only zones.
             if action_enum in _READ_TYPES:
                 return PolicyResult(
                     action_id=action.action_id,

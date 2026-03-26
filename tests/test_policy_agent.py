@@ -129,11 +129,6 @@ def test_review_plan_stamps_all_fields_on_actions(db):
     job_id = _make_job(db)
     _make_action(db, job_id, action_type='file_write', target_path='/tmp/a.txt')
     _make_action(db, job_id, action_type='file_read', target_path='/tmp/b.txt')
-    # Make step_index unique
-    actions_before = get_actions_for_job(job_id, engine=db)
-    actions_before[1].step_index = 1
-    from raoc.db.queries import update_action_status  # reuse engine access pattern
-    from raoc.db import queries as q
     resolver = _make_resolver(ZoneType.SAFE_WORKSPACE)
     agent = PolicyAgent(db, resolver)
     results = agent.review_plan(job_id)
