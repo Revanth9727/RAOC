@@ -1,7 +1,7 @@
 """Policy models for RAOC zone enforcement.
 
 ZoneType enumerates the four zones a filesystem path can belong to.
-PolicyDecision enumerates the five outcomes the policy engine can produce.
+PolicyDecision enumerates the four outcomes the policy engine can produce.
 PolicyResult carries the decision for one ActionObject.
 """
 
@@ -20,7 +20,7 @@ class ZoneType(str, Enum):
 
 
 class PolicyDecision(str, Enum):
-    """Five possible outcomes from the policy engine for one action."""
+    """Four possible outcomes from the policy engine for one action."""
 
     AUTO_APPROVED      = 'auto_approved'
     APPROVAL_REQUIRED  = 'approval_required'
