@@ -7,9 +7,11 @@ from sqlalchemy import inspect
 
 from raoc.db.queries import (
     create_job,
+    get_actions_for_job,
     get_audit_log,
     get_job,
     save_action,
+    update_action_policy,
     update_job_status,
     write_audit,
 )
@@ -193,11 +195,8 @@ def test_write_audit_and_get_audit_log(db):
     assert log[0]['id'] < log[1]['id']
 
 
-from raoc.db.queries import update_action_policy
-
 
 def test_action_object_has_policy_fields():
-    from raoc.models.action import ActionObject
     a = ActionObject(
         job_id='job1',
         step_index=0,
@@ -212,15 +211,6 @@ def test_action_object_has_policy_fields():
 
 
 def test_update_action_policy_persists_fields(tmp_path):
-    from raoc.db.queries import (
-        create_job,
-        get_actions_for_job,
-        save_action,
-        update_action_policy,
-    )
-    from raoc.db.schema import create_tables, get_engine
-    from raoc.models.action import ActionObject
-
     engine = get_engine(db_path=tmp_path / 'test_policy_fields.db')
     create_tables(engine)
 
