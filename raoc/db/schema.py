@@ -44,6 +44,7 @@ jobs = Table(
     Column('found_file_path',        Text),
     Column('implied_task_type',      Text),
     Column('action_instruction',     Text),
+    Column('scope_root',             Text),
 )
 
 actions = Table(
@@ -63,9 +64,7 @@ actions = Table(
     Column('verification_result', Text),
     Column('created_at',         Text,    nullable=False),
     Column('completed_at',       Text),
-    Column('policy_decision',    Text),
-    Column('policy_reason',      Text),
-    Column('target_zone',        Text),
+
 )
 
 audit_log = Table(

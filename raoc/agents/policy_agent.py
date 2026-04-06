@@ -1,176 +1,96 @@
-"""PolicyAgent — evaluates every ActionObject before execution.
+"""PolicyAgent — validates action paths against the job's scope_root.
 
-Reads all actions for a job, evaluates each against the zone model,
-stamps policy_decision / policy_reason / target_zone on each action row,
-writes audit entries, and returns a list[PolicyResult].
-
-State changes (BLOCKED status, gateway messages) are the coordinator's
-responsibility — this agent only stamps and returns.
+Returns a structured PolicyDecision for each plan review:
+    'allowed'        — all actions inside scope_root, proceed
+    'needs_approval' — one or more actions outside scope_root
+    'forbidden'      — one or more actions hit a forbidden path
 """
 
 import logging
 from pathlib import Path
 
+from raoc import config
 from raoc.db import queries
 from raoc.models.action import ActionObject, ActionType
-from raoc.models.policy import PolicyDecision, PolicyResult, ZoneType
-from raoc.substrate.exceptions import AmbiguousZoneError
+from raoc.models.job import JobStatus
+from raoc.models.scope import PolicyDecision, ScopeApproval
 from raoc.substrate.zone_resolver import ZoneResolver
 
 logger = logging.getLogger(__name__)
 
-# Action types that are read-only — auto-approved in read_only zones.
-# Anything not in this set is treated as a write and blocked in read_only zones.
-_READ_TYPES = {
-    ActionType.FILE_READ,
-    ActionType.CMD_INSPECT,
-    ActionType.SCREENSHOT,
-}
-
 
 class PolicyAgent:
-    """Evaluates every planned action against the zone model.
+    """Validates that every action targets a path inside the job's scope_root.
 
-    Does not call Claude. Does not touch job status. Returns results only.
+    Returns a PolicyDecision with status 'allowed', 'needs_approval', or
+    'forbidden'. The coordinator uses this to decide whether to proceed,
+    ask the user, or block.
     """
 
-    def __init__(self, db, zone_resolver: ZoneResolver, llm=None) -> None:
+    def __init__(self, db, zone_resolver: ZoneResolver) -> None:
         """Store db engine and zone resolver."""
         self.db = db
         self.zone_resolver = zone_resolver
 
-    def review_plan(self, job_id: str) -> list[PolicyResult]:
-        """Evaluate every action for a job and stamp policy fields on each row.
+    def review_plan(
+        self,
+        job_id: str,
+        actions: list[ActionObject],
+        approved: list[ScopeApproval] | None = None,
+    ) -> PolicyDecision:
+        """Review all actions against the job's scope_root.
 
-        Returns the full list of PolicyResult, one per action.
-        Each action in the database is updated with policy_decision, policy_reason,
-        and target_zone before this method returns.
+        Returns PolicyDecision with:
+            'allowed'        — all paths inside scope_root (or previously approved)
+            'needs_approval' — at least one path outside scope_root
+            'forbidden'      — at least one path is a forbidden system path
         """
-        actions = queries.get_actions_for_job(job_id, engine=self.db)
-        results: list[PolicyResult] = []
+        job = queries.get_job(job_id, engine=self.db)
+        scope_root = Path(job.scope_root) if job.scope_root else config.WORKSPACE
 
         for action in actions:
-            result = self._evaluate_action(action)
-            queries.update_action_policy(
-                action_id=action.action_id,
-                decision=result.decision.value,
-                reason=result.reason,
-                zone=result.zone.value,
-                engine=self.db,
+            if not action.target_path:
+                continue
+
+            # SCREENSHOT has no local file path — always allowed
+            if action.action_type == ActionType.SCREENSHOT:
+                continue
+
+            target = Path(action.target_path)
+            action_type_str = (
+                action.action_type.value
+                if hasattr(action.action_type, 'value')
+                else str(action.action_type)
             )
-            queries.write_audit(
-                job_id,
-                'policy_decision',
-                detail=f"step {action.step_index}: {result.decision.value} — {result.reason}",
-                engine=self.db,
-            )
-            results.append(result)
-            logger.info(
-                "Policy: job=%s step=%d action=%s → %s",
-                job_id, action.step_index, action.action_type, result.decision.value,
-            )
+            # Map action_type to a simple verb for scope tracking
+            scope_action = 'write' if 'write' in action_type_str else 'read'
 
-        return results
-
-    def _evaluate_action(self, action: ActionObject) -> PolicyResult:
-        """Return the PolicyResult for one action using the decision table.
-
-        Pre-step — Zone resolution: AmbiguousZoneError → judgment_zone immediately.
-        Step 1 — Forbidden check (always wins): forbidden zone → blocked.
-        Step 2 — Capability override: CMD_EXECUTE → approval_required (any zone).
-        Step 3 — Zone table: safe_workspace → auto_approved; read_only + read →
-                 auto_approved; read_only + non-read → blocked; restricted →
-                 approval_required.
-        """
-        target = action.target_path or ''
-        action_type_str = str(action.action_type)
-
-        # Pre-step: Zone resolution (may raise AmbiguousZoneError → judgment_zone)
-        try:
-            zone = self.zone_resolver.resolve(Path(target))
-        except AmbiguousZoneError:
-            return PolicyResult(
-                action_id=action.action_id,
-                decision=PolicyDecision.JUDGMENT_ZONE,
-                zone=ZoneType.RESTRICTED,  # fallback zone for model validity
-                reason=(
-                    f"{target} matches entries in two different zones at equal specificity. "
-                    f"Policy cannot determine which zone applies — review before approving."
-                ),
+            access = self.zone_resolver.check_access(
+                target, scope_root, scope_action, approved,
             )
 
-        # Step 1: Forbidden check (always wins)
-        if zone == ZoneType.FORBIDDEN:
-            return PolicyResult(
-                action_id=action.action_id,
-                decision=PolicyDecision.BLOCKED,
-                zone=zone,
-                reason=(
-                    f"{target} is in the forbidden zone. "
-                    f"This path cannot be automated. This is a permanent restriction "
-                    f"that cannot be bypassed."
-                ),
-            )
-
-        # Step 2: CMD_EXECUTE capability override
-        if action_type_str == ActionType.CMD_EXECUTE.value:
-            return PolicyResult(
-                action_id=action.action_id,
-                decision=PolicyDecision.APPROVAL_REQUIRED,
-                zone=zone,
-                reason=(
-                    f"Script execution always requires approval regardless of location. "
-                    f"Target: {target}."
-                ),
-            )
-
-        # Step 3: Zone table
-        if zone == ZoneType.SAFE_WORKSPACE:
-            return PolicyResult(
-                action_id=action.action_id,
-                decision=PolicyDecision.AUTO_APPROVED,
-                zone=zone,
-                reason=f"{target} is in the safe workspace — auto-approved.",
-            )
-
-        if zone == ZoneType.READ_ONLY:
-            action_enum = None
-            try:
-                action_enum = ActionType(action_type_str)
-            except ValueError:
-                pass
-
-            # Anything not in _READ_TYPES is treated as a write — blocked in read-only zones.
-            if action_enum in _READ_TYPES:
-                return PolicyResult(
-                    action_id=action.action_id,
-                    decision=PolicyDecision.AUTO_APPROVED,
-                    zone=zone,
-                    reason=f"{target} is read-only and this is a read action — auto-approved.",
+            if access == 'forbidden':
+                reason = (
+                    f"'{action.target_path}' is a forbidden system path. "
+                    f"RAOC cannot access this location."
                 )
-            else:
-                return PolicyResult(
-                    action_id=action.action_id,
-                    decision=PolicyDecision.BLOCKED,
-                    zone=zone,
-                    reason=(
-                        f"{target} is in a read-only zone. "
-                        f"Write actions are blocked in read-only zones."
-                    ),
+                queries.update_job_status(
+                    job_id, JobStatus.BLOCKED, error=reason, engine=self.db,
+                )
+                queries.write_audit(job_id, 'job_blocked', detail=reason, engine=self.db)
+                return PolicyDecision(
+                    status='forbidden',
+                    reason=reason,
+                    path=action.target_path,
+                    action=scope_action,
                 )
 
-        if zone == ZoneType.RESTRICTED:
-            return PolicyResult(
-                action_id=action.action_id,
-                decision=PolicyDecision.APPROVAL_REQUIRED,
-                zone=zone,
-                reason=f"{target} is in a restricted zone — requires your approval.",
-            )
+            if access == 'needs_approval':
+                return PolicyDecision(
+                    status='needs_approval',
+                    reason=f"'{action.target_path}' is outside the current allowed directory.",
+                    path=action.target_path,
+                    action=scope_action,
+                )
 
-        # Fallback (should not reach here with valid zone values)
-        return PolicyResult(
-            action_id=action.action_id,
-            decision=PolicyDecision.JUDGMENT_ZONE,
-            zone=zone,
-            reason=f"Unhandled zone state for {target} — review before approving.",
-        )
+        return PolicyDecision(status='allowed')

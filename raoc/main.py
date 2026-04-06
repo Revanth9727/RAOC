@@ -47,7 +47,7 @@ def main() -> None:
     # 7.5 Policy substrate
     from raoc.agents.policy_agent import PolicyAgent
     from raoc.substrate.zone_resolver import ZoneResolver
-    zone_resolver = ZoneResolver(config.ZONE_CONFIG)
+    zone_resolver = ZoneResolver()
     policy_agent = PolicyAgent(db=None, zone_resolver=zone_resolver)
 
     # 8. Coordinator

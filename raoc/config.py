@@ -18,7 +18,7 @@ PROJECT_ROOT    = Path(__file__).parent.parent
 DATA_DIR        = PROJECT_ROOT / 'data'
 DB_PATH         = DATA_DIR / 'raoc.db'
 LOG_PATH        = DATA_DIR / 'raoc.log'
-ZONE_CONFIG     = PROJECT_ROOT / 'zone_config.yaml'
+
 
 # PDF rewrite produces a DOCX. Format changes from PDF to DOCX.
 # This is intentional — communicated to user in plan preview and report.

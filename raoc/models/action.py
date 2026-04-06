@@ -49,9 +49,7 @@ class ActionObject(BaseModel):
     status:              str              = 'pending'
     execution_output:    Optional[str]    = None
     verification_result: Optional[str]   = None
-    policy_decision:     Optional[str]    = None
-    policy_reason:       Optional[str]    = None
-    target_zone:         Optional[str]    = None
+
     created_at:          datetime         = Field(
                              default_factory=lambda: datetime.now(timezone.utc)
                          )

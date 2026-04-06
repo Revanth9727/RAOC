@@ -1,145 +1,125 @@
-"""ZoneResolver — maps filesystem paths to ZoneType values.
+"""ZoneResolver — enforces per-job scope boundaries.
 
-Reads zone_config.yaml on init and caches it. Never re-reads at runtime.
-Four hard-coded overrides cannot be changed via config:
-  - config.WORKSPACE       → safe_workspace (always)
-  - ~/.ssh                 → forbidden (always)
-  - ~/Library/Keychains    → forbidden (always)
-  - ~/.aws                 → forbidden (always)
-  - ~/.config              → forbidden (always)
+Three access levels:
+    inside scope_root  → 'allowed' (no approval needed)
+    outside scope_root → 'needs_approval' (user must approve)
+    forbidden path     → 'forbidden' (always blocked)
 
-For all other paths, the most specific (longest) matching prefix wins.
-Unmatched paths default to restricted.
-Tie (two entries at equal depth) raises AmbiguousZoneError.
-Missing config file logs a warning and treats all unmatched paths as restricted.
+Allowed without approval even for outside-scope paths:
+    path normalisation, forbidden-prefix check, scope comparison.
+
+Requires approval for outside-scope paths:
+    directory listing, file opening, content reading, broad search.
 """
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 from raoc import config
-from raoc.models.policy import ZoneType
-from raoc.substrate.exceptions import AmbiguousZoneError
+from raoc.models.scope import (
+    NeedsPermission,
+    ScopeApproval,
+    expand_forbidden_prefixes,
+)
+from raoc.substrate.exceptions import ScopeViolationError
 
 logger = logging.getLogger(__name__)
 
-# Hard-coded forbidden paths — cannot be overridden by zone_config.yaml
-_HARDCODED_FORBIDDEN: list[Path] = [
-    Path.home() / '.ssh',
-    Path.home() / 'Library' / 'Keychains',
-    Path.home() / '.aws',
-    Path.home() / '.config',
-]
-
 
 class ZoneResolver:
-    """Resolves a filesystem path to its ZoneType.
+    """Resolves whether a path is inside scope, outside scope, or forbidden.
 
-    Instantiate once at startup; call resolve() for each path.
+    Uses a per-job scope_root (not the whole workspace) as the trusted zone.
     """
 
-    def __init__(self, config_path: Path) -> None:
-        """Load zone_config.yaml from config_path.
+    def __init__(self) -> None:
+        self._forbidden = expand_forbidden_prefixes()
 
-        If the file is missing, logs a warning and uses safe defaults
-        (all unmatched paths → restricted).
-        """
-        self._zones: dict[str, ZoneType] = {}  # resolved_path_str → ZoneType
-        self._config_loaded = False
-        self._load(config_path)
+    # ── Core checks (no I/O, safe to call anytime) ───────────────
 
-    def _load(self, config_path: Path) -> None:
-        """Parse zone_config.yaml into self._zones."""
-        if not config_path.exists():
-            logger.warning(
-                "zone_config.yaml not found at %s — all unmatched paths will be treated as "
-                "restricted. Create zone_config.yaml at the project root to configure zones.",
-                config_path,
-            )
-            return
+    def is_forbidden(self, path: Path) -> bool:
+        """Return True if path matches any forbidden prefix."""
+        resolved = path.resolve()
+        return any(
+            resolved == fp or self._is_descendant(resolved, fp)
+            for fp in self._forbidden
+        )
 
+    def is_inside_scope(self, path: Path, scope_root: Path) -> bool:
+        """Return True if path is inside scope_root."""
         try:
-            import yaml
-            with open(config_path) as f:
-                data = yaml.safe_load(f) or {}
-        except Exception as exc:
-            logger.warning("Failed to parse zone_config.yaml (%s): %s", config_path, exc)
-            return
+            path.resolve().relative_to(scope_root.resolve())
+            return True
+        except ValueError:
+            return False
 
-        zone_map = {
-            'safe_workspace': ZoneType.SAFE_WORKSPACE,
-            'read_only':      ZoneType.READ_ONLY,
-            'restricted':     ZoneType.RESTRICTED,
-            'forbidden':      ZoneType.FORBIDDEN,
-        }
-        for zone_name, zone_type in zone_map.items():
-            for raw_path in (data.get(zone_name) or []):
-                resolved = Path(raw_path).expanduser().resolve()
-                key = str(resolved)
-                if key in self._zones and self._zones[key] != zone_type:
-                    logger.warning(
-                        "zone_config.yaml: path %s appears in both '%s' and '%s' zones; "
-                        "keeping '%s' (last assignment wins — fix your config).",
-                        resolved, self._zones[key].value, zone_type.value, zone_type.value,
-                    )
-                self._zones[key] = zone_type
+    def is_inside_workspace(self, path: Path) -> bool:
+        """Return True if path is inside config.WORKSPACE (broad check)."""
+        try:
+            path.resolve().relative_to(config.WORKSPACE.resolve())
+            return True
+        except ValueError:
+            return False
 
-        self._config_loaded = True
-        logger.info("ZoneResolver loaded %d zone entries from %s", len(self._zones), config_path)
+    # ── Main access check ────────────────────────────────────────
 
-    def resolve(self, path: Path) -> ZoneType:
-        """Return the ZoneType for a filesystem path.
+    def check_access(
+        self,
+        path: Path,
+        scope_root: Path,
+        action: str,
+        approved: list[ScopeApproval] | None = None,
+    ) -> str:
+        """Return 'allowed', 'needs_approval', or 'forbidden'.
 
-        Evaluation order:
-          1. Hard-coded safe_workspace override (config.WORKSPACE)
-          2. Hard-coded forbidden overrides (~/.ssh etc.)
-          3. Longest-prefix match from zone_config.yaml
-          4. Default: restricted
-
-        Raises AmbiguousZoneError if two config entries match at equal depth.
+        Checks in order:
+            1. Forbidden prefixes → 'forbidden'
+            2. Inside scope_root → 'allowed'
+            3. Previously approved for this path+action → 'allowed'
+            4. Otherwise → 'needs_approval'
         """
         resolved = path.resolve()
 
-        # 1. Hard-coded safe_workspace
+        if self.is_forbidden(resolved):
+            return 'forbidden'
+
+        if self.is_inside_scope(resolved, scope_root):
+            return 'allowed'
+
+        # Check if user already approved this path+action
+        if approved:
+            for approval in approved:
+                if approval.covers(str(resolved), action):
+                    return 'allowed'
+
+        return 'needs_approval'
+
+    # ── Legacy compatibility ─────────────────────────────────────
+
+    def assert_allowed(self, path: Path) -> None:
+        """Raise ScopeViolationError if path is outside workspace.
+
+        Used as a safety net in execution. Uses the broad workspace check.
+        """
+        if self.is_forbidden(path):
+            raise ScopeViolationError(
+                f"'{path}' is a forbidden system path. "
+                f"RAOC cannot access this location."
+            )
+        if not self.is_inside_workspace(path):
+            raise ScopeViolationError(
+                f"'{path}' is outside the workspace. "
+                f"RAOC only operates inside {config.WORKSPACE}. "
+                f"Copy the file into your workspace first, then ask again."
+            )
+
+    # ── Internal ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_descendant(child: Path, parent: Path) -> bool:
+        """Return True if child is a descendant of parent."""
         try:
-            resolved.relative_to(config.WORKSPACE.resolve())
-            return ZoneType.SAFE_WORKSPACE
+            child.relative_to(parent)
+            return True
         except ValueError:
-            pass
-
-        # 2. Hard-coded forbidden paths
-        for forbidden_root in _HARDCODED_FORBIDDEN:
-            try:
-                resolved.relative_to(forbidden_root.resolve())
-                return ZoneType.FORBIDDEN
-            except ValueError:
-                pass
-
-        # 3. Longest-prefix match from config
-        best_match: Optional[ZoneType] = None
-        best_depth: int = -1
-        tie: bool = False
-
-        for zone_path_str, zone_type in self._zones.items():
-            zone_path = Path(zone_path_str)
-            try:
-                rel = resolved.relative_to(zone_path)
-                depth = len(zone_path.parts)
-                if depth > best_depth:
-                    best_depth = depth
-                    best_match = zone_type
-                    tie = False
-                elif depth == best_depth and zone_type != best_match:
-                    tie = True
-            except ValueError:
-                pass
-
-        if tie:
-            raise AmbiguousZoneError(str(resolved))
-
-        if best_match is not None:
-            return best_match
-
-        # 4. Default
-        return ZoneType.RESTRICTED
+            return False

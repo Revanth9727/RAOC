@@ -42,6 +42,7 @@ def _row_to_job(row) -> JobRecord:
         found_file_path=row['found_file_path'],
         implied_task_type=row['implied_task_type'],
         action_instruction=row['action_instruction'],
+        scope_root=row['scope_root'],
     )
 
 
@@ -71,6 +72,7 @@ def create_job(raw_request: str, engine: Engine = None) -> JobRecord:
             found_file_path=None,
             implied_task_type=None,
             action_instruction=None,
+            scope_root=None,
         ))
     logger.info("Job created: %s", job.job_id)
     return job
@@ -165,31 +167,6 @@ def update_action_status(
         conn.execute(actions.update().where(actions.c.action_id == action_id).values(**values))
 
 
-def update_action_policy(
-    action_id: str,
-    decision: str,
-    reason: str,
-    zone: str,
-    engine: Engine = None,
-) -> None:
-    """Stamp policy_decision, policy_reason, and target_zone onto an existing action row.
-
-    Called by PolicyAgent after PlanningAgent has already inserted the action.
-    Uses UPDATE, not INSERT.
-    """
-    if engine is None:
-        engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(
-            actions.update()
-            .where(actions.c.action_id == action_id)
-            .values(
-                policy_decision=decision,
-                policy_reason=reason,
-                target_zone=zone,
-            )
-        )
-    logger.info("Policy stamped on action %s: %s", action_id, decision)
 
 
 def get_actions_for_job(job_id: str, engine: Engine = None) -> list:
@@ -223,9 +200,7 @@ def _row_to_action(row) -> ActionObject:
         status=row['status'],
         execution_output=row['execution_output'],
         verification_result=row['verification_result'],
-        policy_decision=row['policy_decision'],
-        policy_reason=row['policy_reason'],
-        target_zone=row['target_zone'],
+
         created_at=datetime.fromisoformat(row['created_at']),
         completed_at=datetime.fromisoformat(row['completed_at']) if row['completed_at'] else None,
     )

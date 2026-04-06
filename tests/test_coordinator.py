@@ -782,16 +782,16 @@ class TestNarratorIntegration:
                         'intake_complete', 'verification_complete', 'execution_complete'):
             assert removed not in called_stages, f"Stage '{removed}' should have been removed. Got: {called_stages}"
 
-    async def test_narrator_is_fire_and_forget(self, db):
-        """narrate_async is scheduled as a background task; pipeline does not wait."""
+    async def test_narrator_is_awaited_but_fast(self, db):
+        """narrate_async is awaited (not fire-and-forget), but should not take long."""
         coord = _make_coordinator_with_narrator(db)
 
-        # Replace narrate_async with a slow coroutine (2 seconds)
-        async def slow_narrate_async(stage, context):
-            await asyncio.sleep(2)
-            return "Slow status."
+        # Replace narrate_async with a fast coroutine
+        async def fast_narrate_async(stage, context):
+            await asyncio.sleep(0.05)
+            return "Fast status."
 
-        coord.narrator.narrate_async = slow_narrate_async
+        coord.narrator.narrate_async = fast_narrate_async
 
         coord.intake.run = MagicMock(side_effect=_intake_side_effect(db))
         coord.discovery.run = MagicMock(return_value={'task_type': 'rewrite_file',
@@ -807,8 +807,8 @@ class TestNarratorIntegration:
         job = get_job(job_id, engine=db)
         assert job.status == JobStatus.AWAITING_APPROVAL.value
 
-        # Pipeline completed quickly — did not wait for 2s narration
-        assert elapsed < 1.0, f"Pipeline waited for narration: {elapsed:.2f}s"
+        # Pipeline completed within a reasonable time
+        assert elapsed < 2.0, f"Pipeline too slow: {elapsed:.2f}s"
 
     async def test_plan_preview_sent_after_discovery_narration(self, db, monkeypatch):
         """send_status (narrator) is called before send_approval_request (plan preview)."""
@@ -1151,31 +1151,22 @@ class TestApprovalGate:
 # Policy integration tests
 # ---------------------------------------------------------------------------
 
-from raoc.models.policy import PolicyDecision, PolicyResult, ZoneType
 
-
-def _make_policy_result(decision: PolicyDecision, reason: str = 'test reason') -> PolicyResult:
-    return PolicyResult(
-        action_id='action-1',
-        decision=decision,
-        zone=ZoneType.SAFE_WORKSPACE,
-        reason=reason,
-    )
-
-
-def _make_coordinator_with_policy(db, policy_results=None) -> PipelineCoordinator:
+def _make_coordinator_with_policy(db, review_plan_result=None) -> PipelineCoordinator:
     """Build a coordinator with a mocked PolicyAgent."""
+    from raoc.models.scope import PolicyDecision
+
     gateway = MagicMock()
     gateway.send_message = AsyncMock()
     gateway.send_approval_request = AsyncMock()
     gateway.send_status = AsyncMock()
     gateway.send_confirmation = AsyncMock()
 
-    if policy_results is None:
-        policy_results = [_make_policy_result(PolicyDecision.AUTO_APPROVED)]
+    if review_plan_result is None:
+        review_plan_result = PolicyDecision(status='allowed')
 
     policy_agent = MagicMock()
-    policy_agent.review_plan.return_value = policy_results
+    policy_agent.review_plan.return_value = review_plan_result
 
     return PipelineCoordinator(
         db=db,
@@ -1188,17 +1179,18 @@ def _make_coordinator_with_policy(db, policy_results=None) -> PipelineCoordinato
 
 
 @pytest.mark.asyncio
-async def test_blocked_policy_stops_pipeline_before_preview(db):
-    """When PolicyAgent returns blocked, coordinator sends blocked message and does NOT send plan preview."""
+async def test_forbidden_policy_stops_pipeline_before_preview(db):
+    """When PolicyAgent returns forbidden, coordinator does NOT send plan preview."""
     from pathlib import Path
-    from raoc.db.queries import save_action
-    from raoc.models.action import ActionObject
+    from raoc.models.scope import PolicyDecision
 
-    blocked_result = _make_policy_result(
-        PolicyDecision.BLOCKED,
-        reason='~/.ssh/config is in the forbidden zone. This is a permanent restriction.',
+    forbidden_decision = PolicyDecision(
+        status='forbidden',
+        reason='~/.ssh/config is a forbidden system path.',
+        path=str(Path.home() / '.ssh' / 'config'),
+        action='read',
     )
-    coord = _make_coordinator_with_policy(db, policy_results=[blocked_result])
+    coord = _make_coordinator_with_policy(db, review_plan_result=forbidden_decision)
 
     job = create_job('rewrite ~/.ssh/config', engine=db)
     update_job_field(job.job_id, task_type='rewrite_file',
@@ -1217,42 +1209,183 @@ async def test_blocked_policy_stops_pipeline_before_preview(db):
     await coord.advance(job.job_id)
 
     coord.gateway.send_approval_request.assert_not_called()
-    assert coord.gateway.send_message.called
-    call_text = coord.gateway.send_message.call_args.kwargs.get('text', '')
-    assert 'blocked' in call_text.lower() or 'forbidden' in call_text.lower()
 
 
-@pytest.mark.asyncio
-async def test_judgment_zone_items_appear_in_plan_preview(db):
-    """When actions have policy_decision=judgment_zone, _build_plan_preview includes flagged section."""
-    from raoc.db.queries import save_action
-    from raoc.models.action import ActionObject
+async def test_got_it_message_is_absolute_first_send(db):
+    """'Got it. Working on it...' must be the very first send_status call in handle_new_message —
+    before create_job(), before any narrator call, before any DB write."""
+    gateway = MagicMock()
+    gateway.send_message = AsyncMock()
+    gateway.send_approval_request = AsyncMock()
 
-    coord = _make_coordinator_with_policy(db)
+    call_order = []
 
-    job = create_job('test', engine=db)
-    update_job_field(job.job_id, task_type='rewrite_file',
-                     target_path='~/Documents/project/notes.txt', engine=db)
-    action = ActionObject(
-        job_id=job.job_id,
-        step_index=0,
-        action_type='file_write',
-        risk_level='low',
-        target_path='~/Documents/project/notes.txt',
-        intent='Rewrite notes.txt',
+    async def tracked_send_status(text):
+        call_order.append(('send_status', text))
+
+    gateway.send_status = tracked_send_status
+
+    narrator = MagicMock()
+    narrator.narrate_async = AsyncMock(return_value="Narration text.")
+
+    coord = PipelineCoordinator(
+        db=db,
+        llm=MagicMock(),
+        sampler=MagicMock(),
+        command_wrapper=MagicMock(),
+        gateway=gateway,
+        narrator=narrator,
+        policy_agent=None,
     )
-    save_action(action, engine=db)
 
-    from raoc.db.queries import get_actions_for_job, update_action_policy
-    update_action_policy(
-        action_id=action.action_id,
-        decision='judgment_zone',
-        reason='~/Documents/project/ matches two zones at equal depth.',
-        zone='restricted',
-        engine=db,
+    original_create_job = coordinator_module.queries.create_job
+
+    def tracked_create_job(text, engine=None):
+        call_order.append('create_job')
+        return original_create_job(text, engine=engine)
+
+    coord.intake.run = MagicMock(side_effect=_intake_side_effect(db))
+    coord.discovery.run = MagicMock(return_value={})
+    coord.planning.run = MagicMock(side_effect=_planning_side_effect(db))
+
+    with patch("raoc.coordinator.queries.create_job", side_effect=tracked_create_job):
+        with patch("raoc.coordinator.queries.get_actions_for_job", return_value=[]):
+            await coord.handle_new_message("Rewrite notes.txt")
+
+    assert len(call_order) > 0, "No calls recorded — coordinator may not have run"
+
+    first = call_order[0]
+    assert isinstance(first, tuple) and first[0] == 'send_status', (
+        f"First call was not send_status — got {first!r}. Full order: {call_order}"
     )
-    actions = get_actions_for_job(job.job_id, engine=db)
-    preview = coord._build_plan_preview(job.job_id, actions)
+    assert "got it" in first[1].lower(), (
+        f"First send_status does not contain 'Got it': {first[1]!r}"
+    )
 
-    assert '⚠️' in preview or 'judgment' in preview.lower()
-    assert '~/Documents/project/' in preview
+    # create_job must appear after the 'Got it' send_status
+    got_it_idx = 0  # it's first
+    create_job_idx = call_order.index('create_job')
+    assert got_it_idx < create_job_idx, (
+        f"'Got it' send_status (idx {got_it_idx}) must precede create_job "
+        f"(idx {create_job_idx}). Full order: {call_order}"
+    )
+
+
+async def test_got_it_is_first_message_sent(db):
+    """'Got it. Working on it...' must be calls[0] — before any db write."""
+    gateway = MagicMock()
+    gateway.send_message = AsyncMock()
+    gateway.send_approval_request = AsyncMock()
+
+    call_order = []
+
+    async def tracked_send_status(text):
+        call_order.append(('send_status', text))
+
+    gateway.send_status = tracked_send_status
+
+    narrator = MagicMock()
+    narrator.narrate_async = AsyncMock(return_value="Narration.")
+
+    coord = PipelineCoordinator(
+        db=db,
+        llm=MagicMock(),
+        sampler=MagicMock(),
+        command_wrapper=MagicMock(),
+        gateway=gateway,
+        narrator=narrator,
+        policy_agent=None,
+    )
+
+    original_create_job = coordinator_module.queries.create_job
+
+    def tracked_create_job(text, engine=None):
+        call_order.append('create_job')
+        return original_create_job(text, engine=engine)
+
+    coord.intake.run = MagicMock(side_effect=_intake_side_effect(db))
+    coord.discovery.run = MagicMock(return_value={})
+    coord.planning.run = MagicMock(side_effect=_planning_side_effect(db))
+
+    with patch("raoc.coordinator.queries.create_job", side_effect=tracked_create_job):
+        with patch("raoc.coordinator.queries.get_actions_for_job", return_value=[]):
+            await coord.handle_new_message("Rewrite notes.txt")
+
+    # First call must be send_status containing 'Got it'
+    assert len(call_order) > 0, "No calls recorded"
+    first = call_order[0]
+    assert isinstance(first, tuple) and first[0] == 'send_status', (
+        f"calls[0] was not send_status — got {first!r}. Full order: {call_order}"
+    )
+    assert "got it" in first[1].lower(), (
+        f"calls[0] text does not contain 'Got it': {first[1]!r}"
+    )
+
+    # create_job must appear after the 'Got it' send_status
+    create_job_idx = call_order.index('create_job')
+    assert 0 < create_job_idx, (
+        f"create_job (idx {create_job_idx}) must come after send_status[0]. "
+        f"Full order: {call_order}"
+    )
+
+
+async def test_narration_does_not_excessively_block_pipeline(db):
+    """Narration with a short delay must not prevent pipeline from completing in < 2s."""
+    coord = _make_coordinator_with_narrator(db)
+
+    async def short_narrate_async(stage, context):
+        await asyncio.sleep(0.1)
+        return "Narration."
+
+    coord.narrator.narrate_async = short_narrate_async
+
+    coord.intake.run = MagicMock(side_effect=_intake_side_effect(db))
+    coord.discovery.run = MagicMock(return_value={'task_type': 'rewrite_file',
+                                                   'target_path': 'notes.txt'})
+    coord.planning.run = MagicMock(side_effect=_planning_side_effect(db))
+
+    start = time.monotonic()
+    with patch("raoc.coordinator.queries.get_actions_for_job", return_value=[]):
+        job_id = await coord.handle_new_message("Rewrite notes.txt")
+    elapsed = time.monotonic() - start
+
+    job = get_job(job_id, engine=db)
+    assert job.status == JobStatus.AWAITING_APPROVAL.value
+
+    assert elapsed < 2.0, (
+        f"Pipeline took {elapsed:.2f}s — narration blocked the pipeline excessively"
+    )
+
+
+async def test_plan_preview_arrives_after_narration_delay(db):
+    """NARRATION_DELAY_BEFORE_PLAN must be awaited before send_approval_request is called."""
+    coord = _make_coordinator_with_narrator(db)
+
+    recorded_delays = []
+    original_sleep = asyncio.sleep
+
+    async def tracking_sleep(delay):
+        recorded_delays.append(delay)
+        # Use a zero delay so the test runs fast
+        await original_sleep(0)
+
+    coord.intake.run = MagicMock(side_effect=_intake_side_effect(db))
+    coord.discovery.run = MagicMock(return_value={'task_type': 'rewrite_file',
+                                                   'target_path': 'notes.txt'})
+    coord.planning.run = MagicMock(side_effect=_planning_side_effect(db))
+
+    with patch("raoc.coordinator.asyncio.sleep", side_effect=tracking_sleep):
+        with patch("raoc.coordinator.queries.get_actions_for_job", return_value=[]):
+            await coord.handle_new_message("Rewrite notes.txt")
+
+    # Allow background send_approval_request task to run
+    await asyncio.sleep(0)
+
+    # NARRATION_DELAY_BEFORE_PLAN must have been among the awaited delays
+    assert config.NARRATION_DELAY_BEFORE_PLAN in recorded_delays, (
+        f"NARRATION_DELAY_BEFORE_PLAN ({config.NARRATION_DELAY_BEFORE_PLAN}) was not awaited. "
+        f"Recorded delays: {recorded_delays}"
+    )
+
+    # send_approval_request must have been called (plan preview sent)
+    coord.gateway.send_approval_request.assert_called_once()

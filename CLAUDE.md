@@ -250,7 +250,7 @@ Update this line every time you complete a phase.
 
 ```
 MVP (Phases 1–9): COMPLETE — 272 tests passing
-Phase 1 (Policy Agent + Zone Model): COMPLETE — 293 tests passing
+Phase 1 (Policy Agent + Zone Model): NOT STARTED — 293 tests passing
 Phase 2 (Web Browsing Substrate): NOT STARTED
 ```
 

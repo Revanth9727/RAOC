@@ -11,7 +11,7 @@ from raoc.db.queries import (
     get_audit_log,
     get_job,
     save_action,
-    update_action_policy,
+
     update_job_status,
     write_audit,
 )
@@ -58,7 +58,7 @@ def test_jobs_table_columns(tmp_path):
         'job_id', 'raw_request', 'task_type', 'target_path',
         'status', 'created_at', 'updated_at', 'error_message', 'approval_granted',
         'clarification_question', 'output_path', 'zip_source_path', 'query_intent',
-        'found_file_path', 'implied_task_type', 'action_instruction',
+        'found_file_path', 'implied_task_type', 'action_instruction', 'scope_root',
     }
 
 
@@ -75,7 +75,6 @@ def test_actions_table_columns(tmp_path):
         'action_id', 'job_id', 'step_index', 'action_type', 'risk_level',
         'target_path', 'intent', 'command', 'change_summary', 'status',
         'execution_output', 'verification_result', 'created_at', 'completed_at',
-        'policy_decision', 'policy_reason', 'target_zone',
     }
 
 
@@ -195,45 +194,3 @@ def test_write_audit_and_get_audit_log(db):
     assert log[0]['id'] < log[1]['id']
 
 
-
-def test_action_object_has_policy_fields():
-    a = ActionObject(
-        job_id='job1',
-        step_index=0,
-        action_type='file_write',
-        risk_level='low',
-        target_path='/tmp/foo.txt',
-        intent='Write foo',
-    )
-    assert a.policy_decision is None
-    assert a.policy_reason is None
-    assert a.target_zone is None
-
-
-def test_update_action_policy_persists_fields(tmp_path):
-    engine = get_engine(db_path=tmp_path / 'test_policy_fields.db')
-    create_tables(engine)
-
-    job = create_job('test', engine=engine)
-    action = ActionObject(
-        job_id=job.job_id,
-        step_index=0,
-        action_type='file_write',
-        risk_level='low',
-        target_path='/tmp/foo.txt',
-        intent='Write foo',
-    )
-    save_action(action, engine=engine)
-
-    update_action_policy(
-        action_id=action.action_id,
-        decision='blocked',
-        reason='~/.ssh is forbidden.',
-        zone='forbidden',
-        engine=engine,
-    )
-
-    actions = get_actions_for_job(job.job_id, engine=engine)
-    assert actions[0].policy_decision == 'blocked'
-    assert actions[0].policy_reason == '~/.ssh is forbidden.'
-    assert actions[0].target_zone == 'forbidden'

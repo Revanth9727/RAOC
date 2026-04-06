@@ -1,82 +1,127 @@
-"""Tests for raoc.substrate.zone_resolver.ZoneResolver."""
+"""Tests for raoc.substrate.zone_resolver.ZoneResolver.
 
-import logging
+Tests the scope-aware access model:
+    inside scope_root  → 'allowed'
+    outside scope_root → 'needs_approval'
+    forbidden paths    → 'forbidden'
+"""
+
 from pathlib import Path
 
 import pytest
 
 from raoc import config
-from raoc.models.policy import ZoneType
-from raoc.substrate.exceptions import AmbiguousZoneError
 from raoc.substrate.zone_resolver import ZoneResolver
 
 
-@pytest.fixture()
-def config_file(tmp_path):
-    """Write a minimal zone_config.yaml to a temp path and return that path."""
-    content = """
-safe_workspace:
-  - ~/raoc_workspace
-
-read_only:
-  - ~/Documents/Reference
-  - ~/Downloads
-
-restricted:
-  - ~/Desktop
-  - ~/Documents
-
-forbidden:
-  - ~/.ssh
-  - ~/Library/Keychains
-  - ~/.aws
-  - ~/.config
-"""
-    p = tmp_path / 'zone_config.yaml'
-    p.write_text(content)
-    return p
+@pytest.fixture
+def resolver():
+    return ZoneResolver()
 
 
-@pytest.fixture()
-def resolver(config_file):
-    return ZoneResolver(config_file)
+@pytest.fixture
+def fake_workspace(tmp_path, monkeypatch):
+    ws = tmp_path / 'raoc_workspace'
+    ws.mkdir()
+    monkeypatch.setattr(config, 'WORKSPACE', ws)
+    return ws
 
 
-def test_workspace_always_safe(resolver, tmp_path, monkeypatch):
-    """Any path under config.WORKSPACE resolves to safe_workspace regardless of config."""
-    fake_workspace = tmp_path / 'raoc_workspace'
-    fake_workspace.mkdir()
-    monkeypatch.setattr(config, 'WORKSPACE', fake_workspace)
-    target = fake_workspace / 'scripts' / 'foo.py'
-    assert resolver.resolve(target) == ZoneType.SAFE_WORKSPACE
+# ── is_inside_scope ──────────────────────────────────────────────
 
 
-def test_ssh_always_forbidden(resolver):
-    """~/.ssh is hard-coded forbidden and cannot be overridden by config."""
-    ssh_path = Path.home() / '.ssh' / 'id_rsa'
-    assert resolver.resolve(ssh_path) == ZoneType.FORBIDDEN
+def test_path_inside_scope_root(resolver, fake_workspace):
+    """A path inside scope_root is inside scope."""
+    scope_root = fake_workspace / 'documents'
+    scope_root.mkdir()
+    target = scope_root / 'notes.txt'
+    assert resolver.is_inside_scope(target, scope_root) is True
 
 
-def test_all_hardcoded_forbidden_paths(resolver):
-    """~/Library/Keychains, ~/.aws, ~/.config are also hard-coded forbidden."""
-    home = Path.home()
-    assert resolver.resolve(home / 'Library' / 'Keychains' / 'login.keychain') == ZoneType.FORBIDDEN
-    assert resolver.resolve(home / '.aws' / 'credentials') == ZoneType.FORBIDDEN
-    assert resolver.resolve(home / '.config' / 'some_app' / 'config') == ZoneType.FORBIDDEN
+def test_path_outside_scope_root(resolver, fake_workspace):
+    """A path outside scope_root is not inside scope."""
+    scope_root = fake_workspace / 'documents'
+    scope_root.mkdir()
+    other = fake_workspace / 'scripts'
+    other.mkdir()
+    target = other / 'run.py'
+    assert resolver.is_inside_scope(target, scope_root) is False
 
 
-def test_most_specific_match_wins(resolver):
-    """~/Documents/Reference/report.pdf → read_only, not restricted (~/Documents)."""
-    path = Path.home() / 'Documents' / 'Reference' / 'report.pdf'
-    assert resolver.resolve(path) == ZoneType.READ_ONLY
+# ── is_inside_workspace ──────────────────────────────────────────
 
 
-def test_missing_config_logs_warning_and_uses_restricted(tmp_path, caplog):
-    """Missing zone_config.yaml logs a warning and falls back to restricted for unknown paths."""
-    missing = tmp_path / 'nonexistent.yaml'
-    with caplog.at_level(logging.WARNING):
-        r = ZoneResolver(missing)
-    assert any('zone_config' in record.message.lower() or 'missing' in record.message.lower()
-               for record in caplog.records)
-    # An arbitrary path with no hard-coded override should be restricted
-    assert r.resolve(Path.home() / 'Desktop' / 'foo.txt') == ZoneType.RESTRICTED
+def test_workspace_path_is_in_workspace(resolver, fake_workspace):
+    target = fake_workspace / 'notes.txt'
+    assert resolver.is_inside_workspace(target) is True
+
+
+def test_path_outside_workspace_is_not(resolver, fake_workspace):
+    target = Path.home() / 'Documents' / 'secret.txt'
+    assert resolver.is_inside_workspace(target) is False
+
+
+# ── is_forbidden ─────────────────────────────────────────────────
+
+
+def test_ssh_is_forbidden(resolver):
+    target = Path.home() / '.ssh' / 'id_rsa'
+    assert resolver.is_forbidden(target) is True
+
+
+def test_etc_is_forbidden(resolver):
+    target = Path('/etc/passwd')
+    assert resolver.is_forbidden(target) is True
+
+
+def test_workspace_is_not_forbidden(resolver, fake_workspace):
+    target = fake_workspace / 'notes.txt'
+    assert resolver.is_forbidden(target) is False
+
+
+# ── check_access ─────────────────────────────────────────────────
+
+
+def test_inside_scope_allowed(resolver, fake_workspace):
+    scope_root = fake_workspace / 'documents'
+    scope_root.mkdir()
+    target = scope_root / 'notes.txt'
+    assert resolver.check_access(target, scope_root, 'read') == 'allowed'
+
+
+def test_outside_scope_needs_approval(resolver, fake_workspace):
+    scope_root = fake_workspace / 'documents'
+    scope_root.mkdir()
+    other = fake_workspace / 'scripts'
+    other.mkdir()
+    target = other / 'run.py'
+    assert resolver.check_access(target, scope_root, 'read') == 'needs_approval'
+
+
+def test_forbidden_always_forbidden(resolver, fake_workspace):
+    scope_root = fake_workspace / 'documents'
+    scope_root.mkdir()
+    target = Path.home() / '.ssh' / 'id_rsa'
+    assert resolver.check_access(target, scope_root, 'read') == 'forbidden'
+
+
+# ── assert_allowed ───────────────────────────────────────────────
+
+
+def test_assert_allowed_does_not_raise_for_workspace_path(resolver, fake_workspace):
+    target = fake_workspace / 'notes.txt'
+    resolver.assert_allowed(target)  # must not raise
+
+
+def test_assert_allowed_raises_for_forbidden_path(resolver, fake_workspace):
+    from raoc.substrate.exceptions import ScopeViolationError
+    target = Path.home() / '.ssh' / 'id_rsa'
+    with pytest.raises(ScopeViolationError):
+        resolver.assert_allowed(target)
+
+
+def test_assert_allowed_raises_for_outside_workspace(resolver, fake_workspace):
+    from raoc.substrate.exceptions import ScopeViolationError
+    target = Path.home() / 'Documents' / 'secret.txt'
+    with pytest.raises(ScopeViolationError):
+        resolver.assert_allowed(target)

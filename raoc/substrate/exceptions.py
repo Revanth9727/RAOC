@@ -57,14 +57,3 @@ class ZipFileDetectedError(RaocError):
         self.contents = contents
         super().__init__(f"ZIP file detected: {path.name}")
 
-
-class AmbiguousZoneError(RaocError):
-    """Raised when a path matches two zone entries at equal specificity.
-
-    Carries the path that triggered the tie so PolicyAgent can build
-    a meaningful reason string for the user.
-    """
-
-    def __init__(self, path: str):
-        self.path = path
-        super().__init__(f"Ambiguous zone for path: {path}")

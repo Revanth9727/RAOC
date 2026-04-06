@@ -1,21 +1,22 @@
-"""Tests for raoc.agents.policy_agent.PolicyAgent."""
+"""Tests for raoc.agents.policy_agent.PolicyAgent.
+
+Tests the scope-aware policy model:
+    inside scope_root   → PolicyDecision(status='allowed')
+    outside scope_root  → PolicyDecision(status='needs_approval')
+    forbidden paths     → PolicyDecision(status='forbidden')
+"""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
+from raoc import config
 from raoc.agents.policy_agent import PolicyAgent
-from raoc.db.queries import (
-    create_job,
-    get_actions_for_job,
-    save_action,
-    update_job_field,
-)
+from raoc.db.queries import create_job, update_job_field
 from raoc.db.schema import create_tables, get_engine
-from raoc.models.action import ActionObject
-from raoc.models.policy import PolicyDecision, ZoneType
-from raoc.substrate.exceptions import AmbiguousZoneError
+from raoc.models.action import ActionObject, ActionType
+from raoc.models.scope import ScopeApproval
 from raoc.substrate.zone_resolver import ZoneResolver
 
 
@@ -26,19 +27,16 @@ def db(tmp_path):
     return engine
 
 
-def _make_resolver(zone: ZoneType, raises_ambiguous: bool = False) -> ZoneResolver:
-    """Return a ZoneResolver mock that always returns the given zone (or raises)."""
-    resolver = MagicMock(spec=ZoneResolver)
-    if raises_ambiguous:
-        resolver.resolve.side_effect = AmbiguousZoneError('/some/path')
-    else:
-        resolver.resolve.return_value = zone
-    return resolver
+@pytest.fixture
+def fake_workspace(tmp_path, monkeypatch):
+    ws = tmp_path / 'raoc_workspace'
+    ws.mkdir()
+    monkeypatch.setattr(config, 'WORKSPACE', ws)
+    return ws
 
 
-def _make_action(db, job_id: str, action_type: str = 'file_write',
-                 target_path: str = '/tmp/foo.txt') -> ActionObject:
-    action = ActionObject(
+def _make_action(job_id, target_path, action_type='file_write'):
+    return ActionObject(
         job_id=job_id,
         step_index=0,
         action_type=action_type,
@@ -46,103 +44,120 @@ def _make_action(db, job_id: str, action_type: str = 'file_write',
         target_path=target_path,
         intent='Test action',
     )
-    save_action(action, engine=db)
-    return action
 
 
-def _make_job(db) -> str:
-    job = create_job('test request', engine=db)
-    update_job_field(job.job_id, task_type='rewrite_file',
-                     target_path='/tmp/foo.txt', engine=db)
-    return job.job_id
+# ── Inside scope → allowed ───────────────────────────────────────
 
 
-# --- Individual decision path tests ---
+def test_all_inside_scope_allowed(db, fake_workspace):
+    """Actions inside scope_root return PolicyDecision(status='allowed')."""
+    scope_dir = fake_workspace / 'documents'
+    scope_dir.mkdir()
+    job = create_job('test', engine=db)
+    update_job_field(job.job_id, scope_root=str(scope_dir), engine=db)
 
-def test_safe_workspace_returns_auto_approved(db):
-    job_id = _make_job(db)
-    _make_action(db, job_id, action_type='file_write')
-    resolver = _make_resolver(ZoneType.SAFE_WORKSPACE)
-    agent = PolicyAgent(db, resolver)
-    results = agent.review_plan(job_id)
-    assert results[0].decision == PolicyDecision.AUTO_APPROVED
+    action = _make_action(job.job_id, str(scope_dir / 'notes.txt'))
+    resolver = ZoneResolver()
+    agent = PolicyAgent(db=db, zone_resolver=resolver)
+    decision = agent.review_plan(job.job_id, [action])
 
-
-def test_forbidden_zone_returns_blocked(db):
-    job_id = _make_job(db)
-    _make_action(db, job_id, action_type='file_read', target_path=str(Path.home() / '.ssh' / 'config'))
-    resolver = _make_resolver(ZoneType.FORBIDDEN)
-    agent = PolicyAgent(db, resolver)
-    results = agent.review_plan(job_id)
-    assert results[0].decision == PolicyDecision.BLOCKED
-    assert results[0].zone == ZoneType.FORBIDDEN
+    assert decision.status == 'allowed'
 
 
-def test_read_only_write_returns_blocked(db):
-    job_id = _make_job(db)
-    _make_action(db, job_id, action_type='file_write')
-    resolver = _make_resolver(ZoneType.READ_ONLY)
-    agent = PolicyAgent(db, resolver)
-    results = agent.review_plan(job_id)
-    assert results[0].decision == PolicyDecision.BLOCKED
+# ── Outside scope → needs_approval ───────────────────────────────
 
 
-def test_read_only_read_returns_auto_approved(db):
-    job_id = _make_job(db)
-    _make_action(db, job_id, action_type='file_read')
-    resolver = _make_resolver(ZoneType.READ_ONLY)
-    agent = PolicyAgent(db, resolver)
-    results = agent.review_plan(job_id)
-    assert results[0].decision == PolicyDecision.AUTO_APPROVED
+def test_outside_scope_needs_approval(db, fake_workspace):
+    """Actions outside scope_root return PolicyDecision(status='needs_approval')."""
+    scope_dir = fake_workspace / 'documents'
+    scope_dir.mkdir()
+    other_dir = fake_workspace / 'scripts'
+    other_dir.mkdir()
+    job = create_job('test', engine=db)
+    update_job_field(job.job_id, scope_root=str(scope_dir), engine=db)
+
+    action = _make_action(job.job_id, str(other_dir / 'run.py'))
+    resolver = ZoneResolver()
+    agent = PolicyAgent(db=db, zone_resolver=resolver)
+    decision = agent.review_plan(job.job_id, [action])
+
+    assert decision.status == 'needs_approval'
+    assert 'run.py' in decision.path
 
 
-def test_restricted_non_cmd_returns_approval_required(db):
-    job_id = _make_job(db)
-    _make_action(db, job_id, action_type='file_write')
-    resolver = _make_resolver(ZoneType.RESTRICTED)
-    agent = PolicyAgent(db, resolver)
-    results = agent.review_plan(job_id)
-    assert results[0].decision == PolicyDecision.APPROVAL_REQUIRED
+# ── Forbidden → forbidden ────────────────────────────────────────
 
 
-def test_cmd_execute_always_approval_required_even_in_safe_workspace(db):
-    """CMD_EXECUTE in safe_workspace must still return approval_required (capability override)."""
-    job_id = _make_job(db)
-    _make_action(db, job_id, action_type='cmd_execute')
-    resolver = _make_resolver(ZoneType.SAFE_WORKSPACE)
-    agent = PolicyAgent(db, resolver)
-    results = agent.review_plan(job_id)
-    assert results[0].decision == PolicyDecision.APPROVAL_REQUIRED
+def test_forbidden_path_blocked(db, fake_workspace):
+    """Actions targeting forbidden paths return PolicyDecision(status='forbidden')."""
+    scope_dir = fake_workspace / 'documents'
+    scope_dir.mkdir()
+    job = create_job('test', engine=db)
+    update_job_field(job.job_id, scope_root=str(scope_dir), engine=db)
+
+    action = _make_action(job.job_id, str(Path.home() / '.ssh' / 'id_rsa'))
+    resolver = ZoneResolver()
+    agent = PolicyAgent(db=db, zone_resolver=resolver)
+    decision = agent.review_plan(job.job_id, [action])
+
+    assert decision.status == 'forbidden'
+    assert '.ssh' in decision.reason
 
 
-def test_ambiguous_zone_returns_judgment_zone(db):
-    job_id = _make_job(db)
-    _make_action(db, job_id, action_type='file_write')
-    resolver = _make_resolver(ZoneType.RESTRICTED, raises_ambiguous=True)
-    agent = PolicyAgent(db, resolver)
-    results = agent.review_plan(job_id)
-    assert results[0].decision == PolicyDecision.JUDGMENT_ZONE
+# ── Screenshot always allowed ────────────────────────────────────
 
 
-def test_review_plan_stamps_all_fields_on_actions(db):
-    """review_plan() must persist policy_decision, policy_reason, target_zone on every action."""
-    job_id = _make_job(db)
-    _make_action(db, job_id, action_type='file_write', target_path='/tmp/a.txt')
-    _make_action(db, job_id, action_type='file_read', target_path='/tmp/b.txt')
-    resolver = _make_resolver(ZoneType.SAFE_WORKSPACE)
-    agent = PolicyAgent(db, resolver)
-    results = agent.review_plan(job_id)
+def test_screenshot_always_allowed(db, fake_workspace):
+    """SCREENSHOT actions are always allowed regardless of path."""
+    scope_dir = fake_workspace / 'documents'
+    scope_dir.mkdir()
+    job = create_job('test', engine=db)
+    update_job_field(job.job_id, scope_root=str(scope_dir), engine=db)
 
-    # All results have decisions
-    assert len(results) == 2
-    for r in results:
-        assert r.decision is not None
-        assert r.zone is not None
-        assert r.reason is not None
+    action = _make_action(job.job_id, '', action_type='screenshot')
+    resolver = ZoneResolver()
+    agent = PolicyAgent(db=db, zone_resolver=resolver)
+    decision = agent.review_plan(job.job_id, [action])
 
-    # DB rows are stamped
-    persisted = get_actions_for_job(job_id, engine=db)
-    for a in persisted:
-        assert a.policy_decision is not None
-        assert a.policy_reason is not None
-        assert a.target_zone is not None
+    assert decision.status == 'allowed'
+
+
+# ── Approved path works ──────────────────────────────────────────
+
+
+def test_previously_approved_path_allowed(db, fake_workspace):
+    """If a path was previously approved, check_access returns 'allowed'."""
+    scope_dir = fake_workspace / 'documents'
+    scope_dir.mkdir()
+    other_dir = fake_workspace / 'scripts'
+    other_dir.mkdir()
+    target = str(other_dir / 'run.py')
+    job = create_job('test', engine=db)
+    update_job_field(job.job_id, scope_root=str(scope_dir), engine=db)
+
+    action = _make_action(job.job_id, target)
+    approval = ScopeApproval(path=target, action='write', job_id=job.job_id)
+
+    resolver = ZoneResolver()
+    agent = PolicyAgent(db=db, zone_resolver=resolver)
+    decision = agent.review_plan(job.job_id, [action], approved=[approval])
+
+    assert decision.status == 'allowed'
+
+
+# ── No target path → allowed ─────────────────────────────────────
+
+
+def test_action_with_no_path_allowed(db, fake_workspace):
+    """Actions with no target_path are allowed."""
+    scope_dir = fake_workspace / 'documents'
+    scope_dir.mkdir()
+    job = create_job('test', engine=db)
+    update_job_field(job.job_id, scope_root=str(scope_dir), engine=db)
+
+    action = _make_action(job.job_id, '')
+    resolver = ZoneResolver()
+    agent = PolicyAgent(db=db, zone_resolver=resolver)
+    decision = agent.review_plan(job.job_id, [action])
+
+    assert decision.status == 'allowed'
