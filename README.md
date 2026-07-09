@@ -1,6 +1,28 @@
-# RAOC — Remote Autonomous OS Controller
+# RAOC - Human-in-the-Loop Local Agent Runner
 
-Control your computer from your phone using Telegram and AI. Send a message like "rewrite my notes file to be more professional" or "run a script to analyze my data," review the plan on your phone, tap approve, and get proof it worked. Nothing happens without your explicit permission.
+RAOC is a macOS-only local agent execution framework. A user requests a file or script action from Telegram, reviews the proposed plan, and explicitly approves or denies it before anything runs.
+
+Safety boundaries:
+- Human approval before execution
+- Workspace-only file access
+- Automatic backups before file edits
+- Dangerous command blocking
+- Verification after execution
+- Final report with evidence
+
+---
+
+## Security model
+
+RAOC is intentionally not a fully autonomous agent. Flow: user request -> agent builds a plan -> plan sent for approval -> execution only after approval -> file changes backed up -> verification runs -> report sent back. Blocked by design: unrestricted filesystem access, commands outside the workspace, destructive shell patterns, sudo, silent file modification, execution without approval.
+
+## Limitations
+
+- macOS only
+- Designed for a single trusted user
+- Not intended for server deployment or untrusted workspaces
+- Telegram security depends on correct token and user ID configuration
+- The command-blocking layer reduces risk but is not a formal sandbox
 
 ---
 
